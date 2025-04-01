@@ -19,68 +19,82 @@ app.add_middleware(
 nlp = spacy.load("en_core_web_sm")
 
 # Database connection parameters
-DB_HOST = "localhost"
-DB_PORT = "5432"
-DB_NAME = "GeoNLP"
-DB_USER = "postgres"
-DB_PASSWORD = "csmpl@123"
+DB_CONFIG = {
+    "host": "localhost",
+    "port": "5432",
+    "database": "GeoNLP",
+    "user": "postgres",
+    "password": "csmpl@123",
+}
 
 # Create a connection pool
 try:
-    connection_pool = psycopg2.pool.SimpleConnectionPool(
-        1, 20,
-        host=DB_HOST,
-        port=DB_PORT,
-        database=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD,
-    )
+    connection_pool = psycopg2.pool.SimpleConnectionPool(1, 20, **DB_CONFIG)
     if connection_pool:
         print("Connection pool created successfully")
 except Exception as e:
     print(f"Error creating connection pool: {e}")
 
-# Fetch column names dynamically
+# Fetch table columns dynamically
 def get_table_columns():
     try:
         conn = connection_pool.getconn()
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT column_name FROM information_schema.columns WHERE table_name = 'new_plot_data';
-        """)
-        columns = [row[0] for row in cursor.fetchall()]
-        cursor.close()
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT column_name FROM information_schema.columns WHERE table_name = 'new_plot_data';
+            """)
+            columns = {row[0].lower() for row in cursor.fetchall()}  # Store in a set for quick lookup
         connection_pool.putconn(conn)
         return columns
     except Exception as e:
         print(f"Error fetching column names: {e}")
-        return []
+        return set()
 
-# Get columns from the table
-table_columns = get_table_columns()
+# Fetch distinct land use classifications only when needed
+def get_landuse_classes():
+    try:
+        conn = connection_pool.getconn()
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT DISTINCT landuse FROM new_plot_data;
+            """)
+            landuse_classes = {row[0].lower(): row[0] for row in cursor.fetchall()}
+        connection_pool.putconn(conn)
+        return landuse_classes
+    except Exception as e:
+        print(f"Error fetching land use classes: {e}")
+        return {}
 
 # Request Model
 class QueryRequest(BaseModel):
     query: str
 
-def sentence_cleaner(user_input: str) -> list:
+# Function to clean user query
+def sentence_cleaner(user_input: str):
     doc = nlp(user_input)
-    
-    for ent in doc.ents:
-        print(f"{ent.text} --> {ent.label_}")
+    return [token.text for token in doc if not token.is_stop and not token.is_punct]
 
-    # Removing stopwords and punctuation
-    cleaned_words = [token.text for token in doc if not token.is_stop and not token.is_punct]
-    return cleaned_words
+# Function to match user query with land use classifications
+def get_matched_landuse(cleaned_words):
+    landuse_classes = get_landuse_classes()  # Fetch only when required
+    sentence = " ".join(cleaned_words).lower()
+    return [original for lower, original in landuse_classes.items() if lower in sentence]
 
 @app.post("/process_query")
 async def process_query(request: QueryRequest):
     cleaned_words = sentence_cleaner(request.query)
-    
-    # Check if any word matches a column name
-    matched_columns = [word for word in cleaned_words if word in table_columns]
+    table_columns = get_table_columns()  # Fetch dynamically
+
+    # Check if "landuse" is mentioned in the query
+    matched_columns = [word for word in cleaned_words if word.lower() in table_columns]
+    matched_landuse = get_matched_landuse(cleaned_words) if "landuse" in matched_columns else []
+
+    # Generate CQL filter
+    cql_filter = " OR ".join([f"landuse = '{lu}'" for lu in matched_landuse]) if matched_landuse else None
 
     return {
         "cleanedWords": cleaned_words,
-        "matchedColumns": matched_columns
+        "matchedColumns": matched_columns,
+        "matchedLanduse": matched_landuse,
+        "cqlFilter": cql_filter,
     }
